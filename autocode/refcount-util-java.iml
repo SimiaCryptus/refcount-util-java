@@ -78,9 +78,9 @@
     <orderEntry type="library" name="Maven: com.fasterxml.jackson.core:jackson-databind:2.9.9" level="project" />
     <orderEntry type="library" name="Maven: com.fasterxml.jackson.core:jackson-annotations:2.9.9" level="project" />
     <orderEntry type="library" name="Maven: com.fasterxml.jackson.core:jackson-core:2.9.9" level="project" />
-    <orderEntry type="library" name="Maven: co.fs2:fs2-io_2.11:2.0.1" level="project" />
+    <orderEntry type="library" name="Maven: co.fs2:fs2-io_2.11:2.1.0" level="project" />
     <orderEntry type="library" name="Maven: org.scala-lang:scala-library:2.11.12" level="project" />
-    <orderEntry type="library" name="Maven: co.fs2:fs2-core_2.11:2.0.1" level="project" />
+    <orderEntry type="library" name="Maven: co.fs2:fs2-core_2.11:2.1.0" level="project" />
     <orderEntry type="library" name="Maven: org.scodec:scodec-bits_2.11:1.1.12" level="project" />
     <orderEntry type="library" name="Maven: org.typelevel:cats-core_2.11:2.0.0" level="project" />
     <orderEntry type="library" name="Maven: org.typelevel:cats-macros_2.11:2.0.0" level="project" />

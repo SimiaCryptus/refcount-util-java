@@ -20,12 +20,10 @@ import javax.annotation.Nonnull;
 import java.io.File;
 import java.io.IOException;
 import java.lang.reflect.Field;
-import java.util.Arrays;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Optional;
+import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiFunction;
+import java.util.stream.Collectors;
 
 public abstract class AutoCoder extends ASTVisitor {
   protected static final Logger logger = LoggerFactory.getLogger(AutoCoder.class);
@@ -43,8 +41,10 @@ public abstract class AutoCoder extends ASTVisitor {
   @Nonnull
   public abstract void apply();
 
-  public void apply(BiFunction<CompilationUnit, File, ASTVisitor> visitor) {
-    project.parse().forEach((File file, CompilationUnit compilationUnit) -> {
+  public int apply(BiFunction<CompilationUnit, File, ASTVisitor> visitor) {
+    return project.parse().entrySet().stream().mapToInt(entry -> {
+      File file = entry.getKey();
+      CompilationUnit compilationUnit = entry.getValue();
       logger.debug(String.format("Scanning %s", file));
       final String prevSrc = compilationUnit.toString();
       compilationUnit.accept(visitor.apply(compilationUnit, file));
@@ -53,13 +53,15 @@ public abstract class AutoCoder extends ASTVisitor {
         logger.info("Changed: " + file);
         try {
           FileUtils.write(file, format(finalSrc), "UTF-8");
+          return 1;
         } catch (IOException e) {
           throw new RuntimeException(e);
         }
       } else {
         logger.debug("Not Touched: " + file);
+        return 0;
       }
-    });
+    }).sum();
   }
 
   public String format(String finalSrc) {
@@ -92,6 +94,7 @@ public abstract class AutoCoder extends ASTVisitor {
       }
     }
   }
+
   public <T> T setField(T astNode, String name, Object value) {
     try {
       getField(astNode.getClass(), name).set(astNode, value);
@@ -106,7 +109,7 @@ public abstract class AutoCoder extends ASTVisitor {
     final Optional<Field> parent = Arrays.stream(fields).filter(x -> x.getName().equals(name)).findFirst();
     if (!parent.isPresent()) {
       final Class<?> superclass = nodeClass.getSuperclass();
-      if(superclass != null) {
+      if (superclass != null) {
         return getField(superclass, name);
       } else {
         throw new AssertionError(String.format("Cannot find field %s", name));
@@ -126,7 +129,7 @@ public abstract class AutoCoder extends ASTVisitor {
     return javaConventionsSettings;
   }
 
-  protected boolean derives(ITypeBinding typeBinding, Class<ReferenceCountingBase> baseClass) {
+  protected boolean derives(@Nonnull ITypeBinding typeBinding, @Nonnull Class<ReferenceCountingBase> baseClass) {
     if (typeBinding.getBinaryName().equals(baseClass.getCanonicalName())) return true;
     if (typeBinding.getSuperclass() != null) return derives(typeBinding.getSuperclass(), baseClass);
     return false;
@@ -134,7 +137,7 @@ public abstract class AutoCoder extends ASTVisitor {
 
   @NotNull
   public static String toString(IPackageBinding declaringClassPackage) {
-    return Arrays.stream(declaringClassPackage.getNameComponents()).reduce((a, b)->a+"."+b).get();
+    return Arrays.stream(declaringClassPackage.getNameComponents()).reduce((a, b) -> a + "." + b).get();
   }
 
   @NotNull
@@ -155,16 +158,84 @@ public abstract class AutoCoder extends ASTVisitor {
     return annotation;
   }
 
-  public int lastMention(SimpleName declarationName, Block body) {
-    final List statements = body.statements();
-    final IBinding variableBinding = declarationName.resolveBinding();
-    int lastMention = -1;
+  public ExpressionStatement newLocalVariable(String identifier, Expression expression) {
+    return newLocalVariable(identifier, expression, getType(expression));
+  }
+
+  public ExpressionStatement newLocalVariable(String identifier, Expression expression, Type simpleType) {
+    AST ast = expression.getAST();
+    final VariableDeclarationFragment variableDeclarationFragment = ast.newVariableDeclarationFragment();
+    variableDeclarationFragment.setName(ast.newSimpleName(identifier));
+    final VariableDeclarationExpression variableDeclarationExpression = ast.newVariableDeclarationExpression(variableDeclarationFragment);
+    variableDeclarationExpression.setType(simpleType);
+    final Assignment assignment = ast.newAssignment();
+    assignment.setLeftHandSide(variableDeclarationExpression);
+    assignment.setOperator(Assignment.Operator.ASSIGN);
+    assignment.setRightHandSide((Expression) ASTNode.copySubtree(ast, expression));
+    return ast.newExpressionStatement(assignment);
+  }
+
+  public Type getType(Expression expression) {
+    return getType(expression.getAST(), expression.resolveTypeBinding().getName());
+  }
+
+  public Optional<MethodDeclaration> findMethod(TypeDeclaration typeDeclaration, String name) {
+    return Arrays.stream(typeDeclaration.getMethods()).filter(methodDeclaration -> methodDeclaration.getName().toString().equals(name)).findFirst();
+  }
+
+  public static class Mention {
+    public final Block block;
+    public final int line;
+    public final Statement statement;
+
+    public Mention(Block block, int line, Statement statement) {
+      this.block = block;
+      this.line = line;
+      this.statement = statement;
+    }
+
+    public boolean isReturn() {
+      return statement instanceof ReturnStatement;
+    }
+
+    public boolean isComplexReturn() {
+      if(!isReturn()) return false;
+      return !(((ReturnStatement)statement).getExpression() instanceof Name);
+    }
+
+  }
+
+  public List<Mention> lastMentions(Block block, IBinding variable) {
+    final List statements = block.statements();
+    final ArrayList<Mention> mentions = new ArrayList<>();
+    Mention lastMention = null;
     for (int j = 0; j < statements.size(); j++) {
-      if (contains((ASTNode) statements.get(j), variableBinding)) {
-        lastMention = j;
+      final Statement statement = (Statement) statements.get(j);
+      if (statement instanceof IfStatement) {
+        final IfStatement ifStatement = (IfStatement) statement;
+        final Statement thenStatement = ifStatement.getThenStatement();
+        if (thenStatement instanceof Block) {
+          mentions.addAll(lastMentions((Block) thenStatement, variable)
+              .stream().filter(x -> x.isReturn()).collect(Collectors.toList()));
+        } else if (thenStatement instanceof ReturnStatement && contains(thenStatement, variable)) {
+          new Mention(block, j, thenStatement);
+        }
+        final Statement elseStatement = ifStatement.getElseStatement();
+        if (elseStatement instanceof Block) {
+          mentions.addAll(lastMentions((Block) elseStatement, variable)
+              .stream().filter(x -> x.isReturn()).collect(Collectors.toList()));
+        } else if (elseStatement instanceof ReturnStatement && contains(elseStatement, variable)) {
+          new Mention(block, j, elseStatement);
+        }
+        if (contains(ifStatement.getExpression(), variable)) {
+          lastMention = new Mention(block, j, ifStatement);
+        }
+      } else if (contains(statement, variable)) {
+        lastMention = new Mention(block, j, statement);
       }
     }
-    return lastMention;
+    mentions.add(lastMention);
+    return mentions;
   }
 
   private boolean contains(ASTNode expression, IBinding variableBinding) {
@@ -177,6 +248,49 @@ public abstract class AutoCoder extends ASTVisitor {
       }
     });
     return found.get();
+  }
+
+  public Type getType(@Nonnull AST ast, String name) {
+    if(name.endsWith("[]")) {
+      return ast.newArrayType(getType(ast, name.substring(0,name.length()-2)));
+    } else if(name.contains("\\.")) {
+      return ast.newSimpleType(newQualifiedName(ast, name.split("\\.")));
+    } else {
+      return ast.newSimpleType(ast.newSimpleName(name));
+    }
+  }
+
+  public void delete(Statement parent) {
+    final ASTNode parent1 = parent.getParent();
+    if (parent1 instanceof Block) {
+      final Block block = (Block) parent1;
+      if (block.statements().size() == 1) {
+        final ASTNode blockParent = block.getParent();
+        if (blockParent instanceof Statement) {
+          delete(parent);
+          return;
+        }
+      }
+    } else if (parent1 instanceof Statement) {
+      delete((Statement) parent1);
+      return;
+    }
+    parent.delete();
+  }
+
+  public class FileAstVisitor extends ASTVisitor {
+    protected final CompilationUnit compilationUnit;
+    protected final File file;
+
+    public FileAstVisitor(CompilationUnit compilationUnit, File file) {
+      this.compilationUnit = compilationUnit;
+      this.file = file;
+    }
+
+    public String location(ASTNode node) {
+      return String.format("(%s:%s)", file.getName(), compilationUnit.getLineNumber(node.getStartPosition()));
+    }
+
   }
 
 }

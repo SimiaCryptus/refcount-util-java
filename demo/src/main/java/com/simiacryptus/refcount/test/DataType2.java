@@ -10,7 +10,9 @@ public class DataType2 extends ReferenceCountingBase {
   }
 
   public DataType2(DataType1 value) {
-    this.value = value;
+    if (null != this.value)
+      this.value.freeRef();
+    this.value = value.addRef();
     value.freeRef();
   }
 

@@ -1,18 +1,21 @@
 package com.simiacryptus.refcount.test;
 
 import com.simiacryptus.lang.ref.ReferenceCountingBase;
+import java.util.Arrays;
 
 public class DataType3 extends ReferenceCountingBase {
   public DataType1[] values;
 
   public DataType3(DataType1... values) {
-    this.values = values;
+    if (null != this.values)
+      com.simiacryptus.refcount.test.DataType1.freeRefs(this.values);
+    this.values = com.simiacryptus.refcount.test.DataType1.addRefs(values);
     com.simiacryptus.refcount.test.DataType1.freeRefs(values);
   }
 
   @Override
   public String toString() {
-    return "DataType2{" + "values=" + values + '}';
+    return "DataType3{" + "values=" + Arrays.toString(values) + '}';
   }
 
   public @Override void _free() {

@@ -22,17 +22,21 @@ package com.simiacryptus.devutil;
 import com.simiacryptus.lang.ref.ReferenceCountingBase;
 import org.eclipse.jdt.core.dom.*;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
 import javax.annotation.Nonnull;
 import java.io.File;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
+import java.util.Random;
+import java.util.function.Consumer;
 
 public class RefAutoCoder extends AutoCoder {
 
   private boolean verbose = true;
   private boolean addRefcounting = true;
+  private Random random = new Random();
 
   public RefAutoCoder(String pathname) {
     super(pathname);
@@ -42,11 +46,13 @@ public class RefAutoCoder extends AutoCoder {
   @Nonnull
   public void apply() {
     if (isVerbose()) apply((cu, file) -> new LogNodes(cu, file));
-    apply((cu, file) -> new RemoveRefs());
+    apply((cu, file) -> new RemoveRefs(cu, file));
+    while(apply((cu, file) -> new InlineRefs(cu, file))>0) {};
     if (isAddRefcounting()) {
-      apply((cu, file) -> new InsertMethods());
-      apply((cu, file) -> new InsertAddRefs());
-      apply((cu, file) -> new InsertFreeRefs());
+      apply((cu, file) -> new InsertMethods(cu, file));
+      apply((cu, file) -> new InsertAddRefs(cu, file));
+      apply((cu, file) -> new ModifyFieldSets(cu, file));
+      apply((cu, file) -> new InsertFreeRefs(cu, file));
     }
   }
 
@@ -68,13 +74,20 @@ public class RefAutoCoder extends AutoCoder {
     return this;
   }
 
-  protected class LogNodes extends ASTVisitor {
-    private final File file;
-    private CompilationUnit compilationUnit;
+  public boolean isRefCounted(ITypeBinding resolveTypeBinding) {
+    final ITypeBinding type;
+    if (resolveTypeBinding.isArray()) {
+      type = resolveTypeBinding.getElementType();
+    } else {
+      type = resolveTypeBinding;
+    }
+    return derives(type, ReferenceCountingBase.class);
+  }
+
+  protected class LogNodes extends FileAstVisitor {
 
     private LogNodes(CompilationUnit compilationUnit, File file) {
-      this.compilationUnit = compilationUnit;
-      this.file = file;
+      super(compilationUnit,file);
     }
 
     @Override
@@ -83,8 +96,113 @@ public class RefAutoCoder extends AutoCoder {
     }
   }
 
-  protected class RemoveRefs extends ASTVisitor {
+  protected class ModifyFieldSets extends FileAstVisitor {
 
+    private ModifyFieldSets(CompilationUnit compilationUnit, File file) {
+      super(compilationUnit,file);
+    }
+    @Override
+    public void endVisit(Assignment node) {
+      if(node.getLeftHandSide() instanceof FieldAccess) {
+        final FieldAccess fieldAccess = (FieldAccess) node.getLeftHandSide();
+        final ASTNode parent = node.getParent();
+        if(parent instanceof ExpressionStatement) {
+          final ASTNode parent2 = parent.getParent();
+          if(parent2 instanceof Block) {
+            final Block block = (Block) parent2;
+            final int lineNumber = block.statements().indexOf(parent);
+            final Expression rightHandSide = node.getRightHandSide();
+            final AST ast = node.getAST();
+            if(rightHandSide instanceof Name) {
+              block.statements().add(lineNumber, freeRefStatement(ast, fieldAccess));
+              node.setRightHandSide(wrapAddRef(rightHandSide));
+              logger.info("Simple field-set statement at line " + lineNumber);
+            } else {
+              final Block exchangeBlock = ast.newBlock();
+
+              final String identifier = randomIdentifier();
+              exchangeBlock.statements().add(newLocalVariable(identifier, rightHandSide, getType(ast, fieldAccess.resolveFieldBinding().getType().getName())));
+              exchangeBlock.statements().add(freeRefStatement(ast, fieldAccess));
+
+              final Assignment assignment = ast.newAssignment();
+              assignment.setLeftHandSide((Expression) ASTNode.copySubtree(ast, fieldAccess));
+              assignment.setOperator(Assignment.Operator.ASSIGN);
+              assignment.setRightHandSide(wrapAddRef(ast.newSimpleName(identifier)));
+              exchangeBlock.statements().add(ast.newExpressionStatement(assignment));
+
+              block.statements().set(lineNumber, exchangeBlock);
+              logger.info("Complex field-set statement at line " + lineNumber);
+            }
+          } else {
+            logger.info(String.format("Non-block field-set statement: %s (%s)", parent.getClass(), parent));
+          }
+        } else {
+          logger.info(String.format("Non-ExpressionStatement field-set statement: %s (%s)", parent.getClass(), parent));
+        }
+      }
+      super.endVisit(node);
+    }
+
+    @NotNull
+    public IfStatement freeRefStatement(AST ast, FieldAccess fieldAccess) {
+      final IfStatement ifStatement = ast.newIfStatement();
+      final InfixExpression infixExpression = ast.newInfixExpression();
+      infixExpression.setLeftOperand(ast.newNullLiteral());
+      infixExpression.setRightOperand((Expression) ASTNode.copySubtree(ast, fieldAccess));
+      infixExpression.setOperator(InfixExpression.Operator.NOT_EQUALS);
+      ifStatement.setExpression(infixExpression);
+      ifStatement.setThenStatement(ast.newExpressionStatement(getFreeRefInvocation(fieldAccess, ast)));
+      return ifStatement;
+    }
+
+    @NotNull
+    public MethodInvocation getFreeRefInvocation(Expression fieldAccess, AST ast) {
+      final ITypeBinding type = fieldAccess.resolveTypeBinding();
+      if(type.isArray()) {
+        final String qualifiedName = type.getElementType().getQualifiedName();
+        final MethodInvocation methodInvocation = ast.newMethodInvocation();
+        methodInvocation.setName(ast.newSimpleName("freeRefs"));
+        methodInvocation.setExpression(newQualifiedName(ast, qualifiedName.split("\\.")));
+        methodInvocation.arguments().add(ASTNode.copySubtree(ast, fieldAccess));
+        return methodInvocation;
+      } else {
+        final MethodInvocation invocation = ast.newMethodInvocation();
+        invocation.setExpression((Expression) ASTNode.copySubtree(ast, fieldAccess));
+        invocation.setName(ast.newSimpleName("freeRef"));
+        return invocation;
+      }
+    }
+    @NotNull
+    public Expression wrapAddRef(Expression expression) {
+      final ITypeBinding type = expression.resolveTypeBinding();
+      AST ast = expression.getAST();
+      if(null == type) {
+        logger.warn(String.format("%s - Cannot wrap with addRef (Unresolvable): %s",
+            location(expression),
+            expression.getClass(), expression.toString().trim()
+        ));
+        return expression;
+      } else if(type.isArray()) {
+        final String qualifiedName = type.getElementType().getQualifiedName();
+        final MethodInvocation methodInvocation = ast.newMethodInvocation();
+        methodInvocation.setName(ast.newSimpleName("addRefs"));
+        methodInvocation.setExpression(newQualifiedName(ast, qualifiedName.split("\\.")));
+        methodInvocation.arguments().add(ASTNode.copySubtree(ast, expression));
+        return methodInvocation;
+      } else {
+        final MethodInvocation methodInvocation = ast.newMethodInvocation();
+        methodInvocation.setName(ast.newSimpleName("addRef"));
+        methodInvocation.setExpression((Expression) ASTNode.copySubtree(ast, expression));
+        return methodInvocation;
+      }
+    }
+  }
+
+  protected class RemoveRefs extends FileAstVisitor {
+
+    private RemoveRefs(CompilationUnit compilationUnit, File file) {
+      super(compilationUnit,file);
+    }
     @Override
     public void endVisit(TypeDeclaration node) {
       final ITypeBinding typeBinding = node.resolveBinding();
@@ -104,42 +222,162 @@ public class RefAutoCoder extends AutoCoder {
 
       if (Arrays.asList("addRef", "freeRef", "addRefs", "freeRefs").contains(methodName)) {
         final ASTNode parent = node.getParent();
+        final AST ast = node.getAST();
+        final Expression subject;
+        if(Arrays.asList("addRefs", "freeRefs").contains(methodName)) {
+          subject = (Expression) ASTNode.copySubtree(ast, (ASTNode) node.arguments().get(0));
+        } else {
+          subject = (Expression) ASTNode.copySubtree(ast, node.getExpression());
+        }
         if (parent instanceof MethodInvocation) {
-          final int index = ((MethodInvocation) parent).arguments().indexOf(node);
-          ((MethodInvocation) parent).arguments().set(index, setField(node.getExpression(), "parent", null));
+          final List arguments = ((MethodInvocation) parent).arguments();
+          final int index = arguments.indexOf(node);
+          arguments.set(index, subject);
           logger.debug(String.format("%s removed as argument %s of %s", methodName, index, parent));
         } else if (parent instanceof ExpressionStatement) {
-          parent.delete();
+          delete((ExpressionStatement)parent);
           logger.debug(String.format("%s removed from %s", methodName, parent));
+        } else if (parent instanceof ClassInstanceCreation) {
+          final List arguments = ((ClassInstanceCreation) parent).arguments();
+          final int index = arguments.indexOf(node);
+          arguments.set(index, subject);
+          logger.debug(String.format("%s removed as argument %s of %s", methodName, index, parent));
+        } else if (parent instanceof VariableDeclarationFragment) {
+          ((VariableDeclarationFragment) parent).setInitializer(subject);
+          logger.debug(String.format("%s removed at %s", methodName, location(parent)));
+        } else if (parent instanceof Assignment) {
+          ((Assignment) parent).setRightHandSide(subject);
+          logger.debug(String.format("%s removed at %s", methodName, location(parent)));
         } else {
-          logger.warn(String.format("Cannot remove %s called in %s: %s", methodName, parent.getClass(), parent));
+          logger.warn(String.format("%s - Cannot remove %s called in %s: %s", location(parent), methodName, parent.getClass(), parent));
         }
       }
     }
 
   }
 
-  protected class InsertFreeRefs extends ASTVisitor {
+  protected class InlineRefs extends FileAstVisitor {
 
-    @Override
-    public void endVisit(TypeDeclaration node) {
-      final ITypeBinding typeBinding = node.resolveBinding();
-      if (derives(typeBinding, ReferenceCountingBase.class)) {
-        //addMethod_addRef(node);
-      }
-      super.endVisit(node);
+    private InlineRefs(CompilationUnit compilationUnit, File file) {
+      super(compilationUnit,file);
     }
 
+    @Override
+    public void endVisit(Block node) {
+      if(node.statements().size() == 1 && node.getParent() instanceof Block) {
+        final Block parent = (Block) node.getParent();
+        parent.statements().set(parent.statements().indexOf(node),
+            ASTNode.copySubtree(node.getAST(), (ASTNode) node.statements().get(0)));
+      }
+    }
+
+    @Override
+    public void endVisit(Assignment node) {
+      Statement previousStatement = previousStatement(node);
+      if(previousStatement != null) {
+        if(previousStatement instanceof VariableDeclarationStatement) {
+          final List fragments = ((VariableDeclarationStatement) previousStatement).fragments();
+          if(1 == fragments.size()) {
+            final VariableDeclarationFragment fragment = (VariableDeclarationFragment) fragments.get(0);
+            if(fragment.getName().toString().equals(node.getRightHandSide().toString())) {
+              logger.debug(String.format("Inlining %s at %s", fragment.getName(), location(node)));
+              node.setRightHandSide((Expression) ASTNode.copySubtree(node.getAST(), fragment.getInitializer()));
+              previousStatement.delete();
+            } else {
+              logger.warn(String.format("%s previous variable %s is not used in %s", location(node), fragment.getName(), node.getRightHandSide()));
+            }
+          } else {
+            logger.warn(String.format("%s previous variable has multiple fragments", location(node)));
+          }
+        } else {
+          logger.warn(String.format("%s previous statement is %s", location(node), previousStatement.getClass().getSimpleName()));
+        }
+      }
+    }
+
+    @Nullable
+    public Statement previousStatement(@Nonnull ASTNode node) {
+      if(node instanceof Statement) {
+        final ASTNode statementParent = node.getParent();
+        if(statementParent instanceof Block) {
+          final List statements = ((Block) statementParent).statements();
+          final int statementNumber = statements.indexOf(node);
+          if(statementNumber > 0) {
+            return  (Statement)statements.get(statementNumber - 1);
+          } else {
+            logger.warn(String.format("No previous statement for %s at %s", node.getClass().getSimpleName(), location(node)));
+            return null;
+          }
+        } else {
+          logger.warn(String.format("No previous statement for %s at %s", node.getClass().getSimpleName(), location(node)));
+          return null;
+        }
+      } else {
+        final ASTNode parent = node.getParent();
+        if (null == parent) {
+          logger.warn("No previous statement for %s at %s", node.getClass().getSimpleName(), location(node));
+          return null;
+        } else {
+          return previousStatement(parent);
+        }
+      }
+    }
+
+    @Override
+    public void endVisit(ReturnStatement node) {
+      if(node.getExpression() instanceof Name) {
+        Statement previousStatement = previousStatement(node);
+        if(previousStatement != null) {
+          if(previousStatement instanceof VariableDeclarationStatement) {
+            final List fragments = ((VariableDeclarationStatement) previousStatement).fragments();
+            if(1 == fragments.size()) {
+              final VariableDeclarationFragment fragment = (VariableDeclarationFragment) fragments.get(0);
+              if(fragment.getName().toString().equals(node.getExpression().toString())) {
+                logger.debug(String.format("Inlining %s at %s", fragment.getName(), location(node)));
+                node.setExpression((Expression) ASTNode.copySubtree(node.getAST(), fragment.getInitializer()));
+                previousStatement.delete();
+              }
+            }
+          } else {
+            logger.debug(String.format("Cannot inline - Previous statement is %s at %s", previousStatement.getClass().getSimpleName(), location(node)));
+          }
+        } else {
+          logger.debug(String.format("Cannot inline - No previous statement at %s", location(node)));
+        }
+      }
+    }
+  }
+
+  protected class InsertFreeRefs extends FileAstVisitor {
+
+    private InsertFreeRefs(CompilationUnit compilationUnit, File file) {
+      super(compilationUnit,file);
+    }
 
     @Override
     public void endVisit(VariableDeclarationFragment declaration) {
       final ASTNode parent = declaration.getParent();
       if (parent instanceof VariableDeclarationStatement) {
-        addFreeRef(declaration, ((VariableDeclarationStatement) parent).getType().resolveBinding());
+        final ITypeBinding typeBinding = ((VariableDeclarationStatement) parent).getType().resolveBinding();
+        if(null != typeBinding) {
+          addFreeRef(declaration, typeBinding);
+        } else {
+          logger.warn(String.format("%s - Cannot resolve type of %s", location(parent), parent));
+        }
       } else if (parent instanceof VariableDeclarationExpression) {
-        addFreeRef(declaration, ((VariableDeclarationExpression) parent).getType().resolveBinding());
+        final ITypeBinding typeBinding = ((VariableDeclarationExpression) parent).getType().resolveBinding();
+        if(null != typeBinding) {
+          addFreeRef(declaration, typeBinding);
+        } else {
+          logger.warn(String.format("%s - Cannot resolve type of %s", location(parent), parent));
+        }
       } else if (parent instanceof FieldDeclaration) {
-        addFreeRef(declaration, ((FieldDeclaration) parent).getType().resolveBinding());
+        final ITypeBinding typeBinding = ((FieldDeclaration) parent).getType().resolveBinding();
+        if(null != typeBinding) {
+          addFreeRef(declaration, typeBinding);
+        } else {
+          logger.warn(String.format("%s - Cannot resolve type of %s", location(parent), parent));
+        }
       } else if (parent instanceof LambdaExpression) {
         final LambdaExpression lambdaExpression = (LambdaExpression) parent;
         final IMethodBinding methodBinding = lambdaExpression.resolveMethodBinding();
@@ -158,100 +396,130 @@ public class RefAutoCoder extends AutoCoder {
       addFreeRef(declaration, declaration.getType().resolveBinding());
     }
 
-    public void addFreeRef(VariableDeclaration declaration, ITypeBinding typeBinding) {
+    public void addFreeRef(@Nonnull VariableDeclaration declaration, @Nonnull ITypeBinding typeBinding) {
+      final AST ast = declaration.getAST();
       if (derives(typeBinding, ReferenceCountingBase.class)) {
-        final SimpleName declarationName = declaration.getName();
+        final SimpleName name = declaration.getName();
         ASTNode parent = declaration.getParent();
         if (parent instanceof MethodDeclaration) {
           final MethodDeclaration node = (MethodDeclaration) parent;
-          int lastMention = lastMention(declarationName, node.getBody());
-          node.getBody().statements().add(lastMention + 1, newFreeRef(node.getAST(), declarationName, declaration.resolveBinding().getType()));
-          logger.debug(String.format("Add freeRef for input parameter %s: %s to line %s",
-              declarationName,
-              typeBinding.getQualifiedName(),
-              lastMention + 1
-          ));
+          addFreeRef(declaration, typeBinding, name, node.getBody(), node.getAST());
         } else if (parent instanceof LambdaExpression) {
           final LambdaExpression node = (LambdaExpression) parent;
-          final ASTNode body = node.getBody();
-          if (body instanceof Block) {
-            int lastMention = lastMention(declarationName, (Block) body);
-            ((Block) body).statements().add(lastMention + 1, newFreeRef(node.getAST(), declarationName, declaration.resolveBinding().getType()));
-            logger.debug(String.format("Add freeRef for input parameter %s: %s to line %s",
-                declarationName,
-                typeBinding.getQualifiedName(),
-                lastMention + 1
-            ));
-          } else {
-            logger.warn(String.format("Cannot add freeRef for %s in %s : %s",
-                declarationName,
-                body.getClass(), body.toString().trim()
-            ));
+          final ASTNode lambdaParent = node.getParent();
+          if(!isStream(lambdaParent)) {
+            final ASTNode body = node.getBody();
+            if (body instanceof Block) {
+              final Block block = (Block) body;
+              List<Mention> lastMentions = lastMentions(block, name.resolveBinding());
+              lastMentions.stream().filter(x->!x.isReturn())
+                  .forEach(insertAddRef(declaration, typeBinding, name, block, ast));
+              lastMentions.stream().filter(x->x.isComplexReturn())
+                  .forEach(insertAddRef_ComplexReturn(name, ast));
+            } else {
+              logger.warn(String.format("%s - Cannot add freeRef for %s in %s : %s",
+                  location(declaration),
+                  name,
+                  body.getClass(), body.toString().trim()
+              ));
+            }
           }
         } else if (parent instanceof VariableDeclarationStatement) {
           parent = parent.getParent();
           if (parent instanceof Block) {
-            final Block node = (Block) parent;
-            int lastMention = lastMention(declarationName, node);
-            node.statements().add(lastMention + 1, newFreeRef(node.getAST(), declarationName, declaration.resolveBinding().getType()));
-            logger.debug(String.format("Add freeRef for input parameter %s: %s to line %s",
-                declarationName,
-                typeBinding.getQualifiedName(),
-                lastMention + 1
-            ));
+            addFreeRef(declaration, typeBinding, name, (Block) parent, parent.getAST());
           } else {
-            logger.warn(String.format("Cannot add freeRef for %s (VariableDeclarationStatement) in %s : %s",
-                declarationName,
-                parent.getClass(), parent.toString().trim()
-            ));
-          }
-        } else if (parent instanceof VariableDeclarationStatement) {
-          parent = parent.getParent();
-          if (parent instanceof Block) {
-            final Block node = (Block) parent;
-            int lastMention = lastMention(declarationName, node);
-            node.statements().add(lastMention + 1, newFreeRef(node.getAST(), declarationName, declaration.resolveBinding().getType()));
-            logger.debug(String.format("Add freeRef for input parameter %s: %s to line %s",
-                declarationName,
-                typeBinding.getQualifiedName(),
-                lastMention + 1
-            ));
-          } else {
-            logger.warn(String.format("Cannot add freeRef for %s (VariableDeclarationStatement) in %s : %s",
-                declarationName,
+            logger.warn(String.format("%s - Cannot add freeRef for %s (VariableDeclarationStatement) in %s : %s",
+                location(declaration),
+                name,
                 parent.getClass(), parent.toString().trim()
             ));
           }
         } else if (parent instanceof FieldDeclaration) {
-          final ASTNode parent2 = parent.getParent();
-          if (parent2 instanceof TypeDeclaration) {
-            final TypeDeclaration typeDeclaration = (TypeDeclaration) parent2;
-            final Optional<MethodDeclaration> freeMethod = Arrays.stream(typeDeclaration.getMethods()).filter(methodDeclaration -> methodDeclaration.getName().toString().equals("_free")).findFirst();
-            if (freeMethod.isPresent()) {
-              final AST ast = parent2.getAST();
-              final MethodInvocation methodInvocation = ast.newMethodInvocation();
-              methodInvocation.setName(ast.newSimpleName("freeRef"));
-              methodInvocation.setExpression(ast.newSimpleName(declarationName.toString()));
-              freeMethod.get().getBody().statements().add(ast.newExpressionStatement(methodInvocation));
+          final ASTNode fieldParent = parent.getParent();
+          if (fieldParent instanceof TypeDeclaration) {
+            final TypeDeclaration typeDeclaration = (TypeDeclaration) fieldParent;
+            final Optional<MethodDeclaration> freeMethodOpt = findMethod(typeDeclaration, "_free");
+            if (freeMethodOpt.isPresent()) {
+              final MethodDeclaration freeMethod = freeMethodOpt.get();
+              final ExpressionStatement expressionStatement = freeRefStatement(ast, name);
+              final Block body = freeMethod.getBody();
+              logger.info(String.format("%s - Adding freeRef for %s::%s to %s - %s ++ %s",
+                  location(declaration),
+                  typeDeclaration.getName(),
+                  declaration.getName(),
+                  location(freeMethod),
+                  body,
+                  expressionStatement
+              ));
+              body.statements().add(0,expressionStatement);
             } else {
-              logger.warn(String.format("Cannot add freeRef for %s::%s - no _free method",
-                  typeDeclaration.getName().toString(),
-                  declaration.getName().toString()
+              logger.warn(String.format("%s - Cannot add freeRef for %s::%s - no _free method",
+                  location(declaration),
+                  typeDeclaration.getName(),
+                  declaration.getName()
               ));
             }
           } else {
-            logger.warn(String.format("Cannot add freeRef for %s (FieldDeclaration) in %s : %s",
-                declarationName,
-                parent2.getClass(), parent2.toString().trim()
+            logger.warn(String.format("%s - Cannot add freeRef for %s (FieldDeclaration) in %s : %s",
+                location(declaration),
+                name,
+                fieldParent.getClass(), fieldParent.toString().trim()
             ));
           }
         } else {
-          logger.warn(String.format("Cannot add freeRef for %s in %s : %s",
-              declarationName,
+          logger.warn(String.format("%s - Cannot add freeRef for %s in %s : %s",
+              location(declaration),
+              name,
               parent.getClass(), parent.toString().trim()
           ));
         }
       }
+    }
+
+    public boolean isStream(ASTNode lambdaParent) {
+      final boolean isStream;
+      if(lambdaParent instanceof MethodInvocation) {
+        final ITypeBinding targetClass = ((MethodInvocation) lambdaParent).getExpression().resolveTypeBinding();
+        isStream = targetClass.getQualifiedName().startsWith("java.util.stream.Stream");
+      } else {
+        isStream = false;
+      }
+      return isStream;
+    }
+
+    public void addFreeRef(VariableDeclaration declaration, ITypeBinding typeBinding, SimpleName name, Block body, AST ast) {
+      final List<Mention> lastMentions = lastMentions(body, name.resolveBinding());
+      lastMentions.stream().filter(x->!x.isReturn())
+          .forEach(insertAddRef(declaration, typeBinding, name, body, ast));
+      lastMentions.stream().filter(x->x.isComplexReturn())
+          .forEach(insertAddRef_ComplexReturn(name, ast));
+    }
+
+    @NotNull
+    public Consumer<Mention> insertAddRef_ComplexReturn(SimpleName name, AST ast) {
+      return mention->{
+        final ReturnStatement returnStatement = (ReturnStatement) mention.statement;
+        final String identifier = randomIdentifier();
+        final List statements = mention.block.statements();
+        statements.add(mention.line, newLocalVariable(identifier, returnStatement.getExpression()));
+        statements.add(mention.line+1, freeRefStatement(ast, ast.newSimpleName(name.getIdentifier())));
+        final ReturnStatement newReturnStatement = ast.newReturnStatement();
+        newReturnStatement.setExpression(ast.newSimpleName(identifier));
+        statements.set(mention.line+2, newReturnStatement);
+      };
+    }
+
+    @NotNull
+    public Consumer<Mention> insertAddRef(VariableDeclaration declaration, ITypeBinding typeBinding, SimpleName declarationName, Block body, AST ast) {
+      return lastMention->{
+        body.statements().add(lastMention.line + 1, newFreeRef(ast, declarationName, declaration.resolveBinding().getType()));
+        logger.debug(String.format("Add freeRef for input parameter %s: %s to line %s",
+            declarationName,
+            typeBinding.getQualifiedName(),
+            lastMention.line + 1
+        ));
+      };
     }
 
     public ExpressionStatement newFreeRef(AST ast, SimpleName declarationName, ITypeBinding type) {
@@ -287,7 +555,7 @@ public class RefAutoCoder extends AutoCoder {
                 methodInvocation.setName(ast.newSimpleName("addRef"));
                 methodInvocation.setExpression(ast.newSimpleName(name.toString()));
                 arguments.set(i, methodInvocation);
-                logger.info(String.format("Argument addRef for %s: %s (%s) defined by %s", node.getName(), typeBinding.getQualifiedName(), name.toString(), methodBinding.getDeclaringClass().getQualifiedName()));
+                logger.info(String.format("Argument addRef for %s: %s (%s) defined by %s", node.getName(), typeBinding.getQualifiedName(), name, methodBinding.getDeclaringClass().getQualifiedName()));
               }
             }
           }
@@ -301,8 +569,24 @@ public class RefAutoCoder extends AutoCoder {
 
   }
 
-  protected class InsertAddRefs extends ASTVisitor {
+  @NotNull
+  public String randomIdentifier() {
+    return "temp" + Long.toString(Math.abs(random.nextLong())).substring(0,4);
+  }
 
+  @NotNull
+  public ExpressionStatement freeRefStatement(AST ast, SimpleName declarationName) {
+    final MethodInvocation methodInvocation = ast.newMethodInvocation();
+    methodInvocation.setName(ast.newSimpleName("freeRef"));
+    methodInvocation.setExpression(ast.newSimpleName(declarationName.toString()));
+    return ast.newExpressionStatement(methodInvocation);
+  }
+
+  protected class InsertAddRefs extends FileAstVisitor {
+
+    private InsertAddRefs(CompilationUnit compilationUnit, File file) {
+      super(compilationUnit,file);
+    }
     @Override
     public void endVisit(ConstructorInvocation node) {
       final IMethodBinding methodBinding = node.resolveConstructorBinding();
@@ -351,7 +635,7 @@ public class RefAutoCoder extends AutoCoder {
             final ITypeBinding resolveTypeBinding = name.resolveTypeBinding();
             if (isRefCounted(resolveTypeBinding)) {
               arguments.set(i, addAddRef(name, resolveTypeBinding, ast));
-              logger.info(String.format("Argument addRef for %s: %s (%s) defined by %s", methodName, resolveTypeBinding.getQualifiedName(), name.toString(), declaringClass.getQualifiedName()));
+              logger.info(String.format("Argument addRef for %s: %s (%s) defined by %s", methodName, resolveTypeBinding.getQualifiedName(), name, declaringClass.getQualifiedName()));
             }
           }
         }
@@ -381,17 +665,11 @@ public class RefAutoCoder extends AutoCoder {
 
   }
 
-  public boolean isRefCounted(ITypeBinding resolveTypeBinding) {
-    final ITypeBinding type;
-    if (resolveTypeBinding.isArray()) {
-      type = resolveTypeBinding.getElementType();
-    } else {
-      type = resolveTypeBinding;
-    }
-    return derives(type, ReferenceCountingBase.class);
-  }
+  protected class InsertMethods extends FileAstVisitor {
 
-  protected class InsertMethods extends ASTVisitor {
+    public InsertMethods(CompilationUnit cu, File file) {
+      super(cu, file);
+    }
 
     @Override
     public void endVisit(TypeDeclaration node) {
